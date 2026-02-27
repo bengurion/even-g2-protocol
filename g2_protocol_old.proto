@@ -1,0 +1,1101 @@
+// Even Realities G2 Protocol Buffers
+// Reverse engineered from BLE traffic analysis + SDK type definitions
+//
+// NOTE: Field numbers and types are inferred from captured packets
+// and the Even Hub SDK (TypeScript type stubs with PB field comments).
+//
+// SERVICE ID CONVENTION (discovered via session_probe 2026-02-26):
+//   0xXX-20 = Data command (phone → glasses)
+//   0xXX-00 = Control/ack response (glasses → phone)
+//   0xXX-01 = Data response (glasses → phone)
+//
+// SDK SOURCE: @evenrealities/even_hub_sdk/dist/index.d.ts (1210 lines)
+// All "对应 PB:" comments in the SDK reference actual protobuf field names.
+//
+// G1 CORRELATION (2026-02-27):
+//   Cross-referenced with EvenDemoApp (G1 Flutter demo, github.com/even-realities/EvenDemoApp).
+//   G1 uses Nordic UART (6E400001) + simple cmd-byte protocol (no protobuf).
+//   G2 migrated to custom UUID (00002760-08c2-11e1-...) + protobuf payloads.
+//   Functional mapping:
+//     G1 cmd 0x0E (mic on)      → G2 AudioControl / unknown BLE service
+//     G1 cmd 0x4E (AI text)     → G2 Teleprompter 0x06-20 + EvenHub containers
+//     G1 cmd 0x25 (heartbeat)   → G2 SyncMessage 0x80-00 (type=0x0E) ✅ CONFIRMED
+//     G1 cmd 0xF5 (events)      → G2 EventStream 0x01-01 ⚠️ REQUIRES SDK SESSION
+//     G1 cmd 0x18 (exit)        → G2 ShutDownContaniner
+//     G1 cmd 0xF1 (LC3 audio)   → G2 AudioEventPayload (decoded to PCM by Flutter)
+//     G1 cmd 0x4B (notify JSON) → G2 NotificationMessage 0x02-20
+//     G1 cmd 0x15/0x20/0x16 (BMP) → G2 ImageRawDataUpdateFields
+//     G1 cmd 0x34 (serial num)  → G2 DeviceInfoRequest 0x09-00
+//     G1 cmd 0x04 (app whitelist) → G2 unknown (may be deprecated)
+//
+// HARDWARE VALIDATION (2026-02-27, test_g1_findings.py):
+//   ✅ Heartbeat: SyncMessage(type=0x0E) on 0x80-00 — glasses echo back, 8s interval
+//   ✅ Transport: dir byte confirmed (0x21=out, 0x12=in), NOT type field
+//   ❌ Event stream: NOT triggered by raw BLE service commands alone
+//   ❌ Mic enable: All 6 raw BLE approaches failed (no audio data received)
+//   ❌ Service preamble: DeviceInfo/Config/Dashboard/DisplayWake/Tasks/
+//      DisplayTrigger commands do NOT activate event stream
+//   ⚠️ Event stream requires EvenHub SDK container lifecycle (Flutter host)
+//   ⚠️ Raw service commands can put glasses in confused state (needs power cycle)
+//
+// DUAL-BLE + R1 RING ARCHITECTURE (2026-02-27, HCI stream capture):
+//   ✅ CONFIRMED: G2 system is THREE BLE peripherals:
+//     - Left arm  (glasses)
+//     - Right arm (glasses)
+//     - R1 Ring   (input controller)
+//   The Even Hub app (com.even.sg) connects to all three simultaneously:
+//     Device 1: A590B18A-C0B2-... → Left/Right arm, connects first (t=27s), 4 char subscribes
+//     Device 2: 45E760C1-9F05-... → Left/Right arm, connects second (t=33s), 4 char subscribes
+//     Device 3: 884A62D5-E0EB-... → R1 RING, connects third (t=44s), 1 char subscribe
+//   Each glasses arm exposes identical GATT services (4 services, 8 characteristics).
+//   The R1 ring only needs 1 characteristic — it sends control events to the glasses.
+//
+//   R1 RING ROLE:
+//     The R1 ring is the PRIMARY INPUT DEVICE for the G2 glasses.
+//     It sends: tap, double tap, long press, scroll up/down events.
+//     These events are what drive teleprompter scrolling, menu navigation,
+//     and likely the "Start Even AI" trigger (long press → mic activation).
+//     The ring communicates with the glasses (possibly directly, or via phone relay).
+//     Events from the ring appear on service 0x01-01 (EventStream).
+//
+//   ARM TOUCH SENSORS:
+//     Both glasses arms have capacitive touch sensors (TouchBar).
+//     Touching BOTH arms simultaneously activates QUIET MODE in Even Hub.
+//     Individual arm touches produce tap/swipe events; simultaneous dual-arm
+//     touch is a distinct gesture with its own event category.
+//
+//   G1 EvenDemoApp confirms: "each arm corresponds to a separate BLE connection"
+//     - Default: send commands to BOTH sides
+//     - Mic activation (0x0E 0x01): right side only (mic is on right arm)
+//     - BMP images: sent to both in parallel
+//   Device names follow pattern: Even G2_XX_{L|R}_YYYYYY
+//   Our python/bleak scripts only connected to 1-2 devices — missing the ring
+//   may explain why events/gestures weren't captured in some tests.
+
+syntax = "proto3";
+
+package even.g2;
+
+// =============================================================================
+// Transport Layer (NOT protobuf — raw binary framing)
+// =============================================================================
+//
+// BLE GATT TABLE (from HCI statedump, 2026-02-27):
+//
+// Service 0x1001  handle=0x0820  end=0x0825  "System/Init"
+//   Char 0x0001   decl=0x0821 val=0x0822     System write
+//   Char 0x0002   decl=0x0823 val=0x0824     System notify
+//
+// Service 0x5450  handle=0x0840  end=0x0845  "Protocol" (main command channel)
+//   Char 0x5401   decl=0x0841 val=0x0842     Write (phone→glasses, all commands)
+//   Char 0x5402   decl=0x0843 val=0x0844     Notify (glasses→phone, all responses)
+//
+// Service 0x6450  handle=0x0860  end=0x0865  "Display"
+//   Char 0x6401   decl=0x0861 val=0x0862     Display write (204-byte render packets)
+//   Char 0x6402   decl=0x0863 val=0x0864     Display notify
+//   ★ DUAL-PURPOSE: 0x6402 also carries mic audio (205B packets, no 0xAA framing)
+//     When mic is active, audio streams on 0x6402 LEFT arm at 20 Hz, 205 bytes/pkt
+//     Distinguish from display data: audio=exactly 205 bytes, no 0xAA prefix
+//
+// Service 0x7450  handle=0x0880  end=0x0885  "Audio"
+//   Char 0x7401   decl=0x0881 val=0x0882     Audio write (commands)
+//   Char 0x7402   decl=0x0883 val=0x0884     Audio notify
+//   ★ NOT USED for G2 mic streaming — audio goes on 0x6402 display channel instead
+//
+// MTU: 527 bytes (ATT central, rx=251, tx=251, ce=7500us)
+// Connection: LE, lmHandle increments per device (0x42, 0x43, 0x44)
+//
+// Even Hub subscription pattern (4 notify characteristics per arm):
+//   Subscribe 0x5402 → protocol responses
+//   Subscribe 0x0002 → system notifications
+//   Subscribe 0x6402 → display feedback + ★ MIC AUDIO (205B packets when active)
+//   Subscribe 0x7402 → audio stream (UNUSED — audio actually on 0x6402)
+// Our scripts only subscribed to 0x5402 — missing 3 channels!
+//
+// PACKET FRAMING (on 0x5401 write / 0x5402 notify):
+//
+// Offset  Bytes  Field     Description
+// ──────  ─────  ────────  ──────────────────────────────────────────────────
+//  0       1     magic     Always 0xAA
+//  1       1     dir       Direction: 0x21 = phone→glasses, 0x12 = glasses→phone
+//  2       1     seq       Sequence number (increments per packet, wraps 0xFF)
+//  3       1     len       Bytes remaining after header = len(payload) + 2 (CRC)
+//  4       1     pkt_tot   Total packets in multi-packet message (always 1 observed)
+//  5       1     pkt_ser   Packet serial within message (always 1 observed)
+//  6       1     svc_hi    Service ID high byte
+//  7       1     svc_lo    Service ID low byte (0x20=data cmd, 0x00=ctl/ack, 0x01=data resp)
+//  8..N-2  var   payload   Protobuf-encoded payload
+//  N-1..N  2     crc16     CRC-16/CCITT (init 0xFFFF) over payload only, little-endian
+//
+// Total packet size = 8 (header) + payload_len + 2 (CRC) = 10 + payload_len
+// Verified: len field = payload_len + 2, NOT total packet size
+
+// =============================================================================
+// Enums (from SDK PB alignment)
+// =============================================================================
+
+// OS-level touch/gesture event types
+// Source: SDK OsEventTypeList — "对齐 PB: OsEventTypeList"
+enum OsEventType {
+  CLICK_EVENT = 0;
+  SCROLL_TOP_EVENT = 1;
+  SCROLL_BOTTOM_EVENT = 2;
+  DOUBLE_CLICK_EVENT = 3;
+  FOREGROUND_ENTER_EVENT = 4;
+  FOREGROUND_EXIT_EVENT = 5;
+  ABNORMAL_EXIT_EVENT = 6;
+}
+
+// EvenHub event types (Flutter → WebView push)
+// Source: SDK EvenHubEventType enum
+enum EvenHubEventType {
+  EVENT_NOT_SET = 0;
+  EVENT_LIST = 1;
+  EVENT_TEXT = 2;
+  EVENT_SYS = 3;
+  EVENT_AUDIO = 4;
+}
+
+// EvenHub error/result codes
+// Source: SDK EvenHubErrorCodeName — "对齐宿主 PB：EvenHub_ErrorCode_List"
+enum EvenHubErrorCode {
+  APP_REQUEST_CREATE_PAGE_SUCCESS = 0;
+  APP_REQUEST_CREATE_INVAILD_CONTAINER = 1;
+  APP_REQUEST_CREATE_OVERSIZE_RESPONSE_CONTAINER = 2;
+  APP_REQUEST_CREATE_OUTOFMEMORY_CONTAINER = 3;
+  APP_REQUEST_UPGRADE_IMAGE_RAW_DATA_SUCCESS = 4;
+  APP_REQUEST_UPGRADE_IMAGE_RAW_DATA_FAILED = 5;
+  APP_REQUEST_REBUILD_PAGE_SUCCESS = 6;
+  APP_REQUEST_REBUILD_PAGE_FAILD = 7;
+  APP_REQUEST_UPGRADE_TEXT_DATA_SUCCESS = 8;
+  APP_REQUEST_UPGRADE_TEXT_DATA_FAILED = 9;
+  APP_REQUEST_UPGRADE_SHUTDOWN_SUCCESS = 10;
+  APP_REQUEST_UPGRADE_SHUTDOWN_FAILED = 11;
+  APP_REQUEST_UPGRADE_HEARTBEAT_PACKET_SUCCESS = 12;
+}
+
+// App methods callable from WebView
+// Source: SDK EvenAppMethod enum
+enum EvenAppMethod {
+  METHOD_UNSPECIFIED = 0;
+  GET_USER_INFO = 1;
+  GET_GLASSES_INFO = 2;
+  SET_LOCAL_STORAGE = 3;
+  GET_LOCAL_STORAGE = 4;
+  CREATE_STARTUP_PAGE_CONTAINER = 5;
+  REBUILD_PAGE_CONTAINER = 6;
+  UPDATE_IMAGE_RAW_DATA = 7;
+  TEXT_CONTAINER_UPGRADE = 8;
+  AUDIO_CONTROL = 9;
+  SHUTDOWN_PAGE_CONTAINER = 10;
+}
+
+// =============================================================================
+// EvenHub Container Properties (SDK PB-aligned models)
+// =============================================================================
+
+// Source: SDK ListItemContainerProperty — "对齐 PB：List_ItemContainerProperty"
+message ListItemContainerProperty {
+  uint32 Item_Count = 1;
+  uint32 Item_Width = 2;
+  uint32 Is_Item_Select_Border_En = 3;  // 0 or 1
+  repeated string Item_Name = 4;
+}
+
+// Source: SDK ListContainerProperty — "对齐 PB：ListContainerProperty"
+message ListContainerProperty {
+  uint32 X_Position = 1;
+  uint32 Y_Position = 2;
+  uint32 Width = 3;
+  uint32 Height = 4;
+  uint32 Border_Width = 5;
+  uint32 Border_Color = 6;
+  uint32 Border_Rdaius = 7;              // NOTE: PB spelling is "Rdaius" (typo in firmware)
+  uint32 Padding_Length = 8;
+  uint32 Container_ID = 9;
+  string Container_Name = 10;
+  ListItemContainerProperty Item_Container = 11;
+  uint32 Is_event_capture = 12;          // 0 or 1
+}
+
+// Source: SDK TextContainerProperty — "对齐 PB：TextContainerProperty"
+message TextContainerProperty {
+  uint32 X_Position = 1;
+  uint32 Y_Position = 2;
+  uint32 Width = 3;
+  uint32 Height = 4;
+  uint32 Border_Width = 5;
+  uint32 Border_Color = 6;
+  uint32 Border_Rdaius = 7;
+  uint32 Padding_Length = 8;
+  uint32 Container_ID = 9;
+  string Container_Name = 10;
+  uint32 Is_event_capture = 11;
+  string Content = 12;
+}
+
+// Source: SDK ImageContainerProperty — "对齐 PB：ImageContainerProperty"
+message ImageContainerProperty {
+  uint32 X_Position = 1;
+  uint32 Y_Position = 2;
+  uint32 Width = 3;
+  uint32 Height = 4;
+  uint32 Container_ID = 5;
+  string Container_Name = 6;
+}
+
+// =============================================================================
+// EvenHub Page Management (SDK PB-aligned)
+// =============================================================================
+
+// Source: SDK CreateStartUpPageContainer — "对应 PB：CreateStartUpPageContainer"
+// Sent via bridge.createStartUpPageContainer()
+// Defines the initial UI layout on the glasses display
+message CreateStartUpPageContainer {
+  uint32 ContainerTotalNum = 1;
+  repeated ListContainerProperty List_Object = 2;
+  repeated TextContainerProperty Text_Object = 3;
+  repeated ImageContainerProperty Image_Object = 4;
+}
+
+// Source: SDK RebuildPageContainer — same structure as CreateStartUpPageContainer
+// Sent via bridge.rebuildPageContainer()
+// Replaces the entire UI layout
+message RebuildPageContainer {
+  uint32 ContainerTotalNum = 1;
+  repeated ListContainerProperty List_Object = 2;
+  repeated TextContainerProperty Text_Object = 3;
+  repeated ImageContainerProperty Image_Object = 4;
+}
+
+// Source: SDK TextContainerUpgrade — "对应宿主 PB：TextContainerUpgrade"
+// Sent via bridge.textContainerUpgrade()
+// Partial text update (offset-based)
+message TextContainerUpgrade {
+  uint32 Container_ID = 1;
+  string Container_Name = 2;
+  uint32 ContentOffset = 3;
+  uint32 ContentLength = 4;
+  string Content = 5;
+}
+
+// Source: SDK ImageRawDataUpdateFields — "对齐 PB：ImageRawDataUpdate"
+// Sent via bridge.updateImageRawData() — fragmented image uploads
+message ImageRawDataUpdateFields {
+  uint32 Container_ID = 1;
+  string Container_Name = 2;
+  uint32 mapSessionId = 3;
+  uint32 mapTotalSize = 4;
+  uint32 compressMode = 5;                // Compression codec ID
+  uint32 mapFragmentIndex = 6;
+  uint32 mapFragmentPacketSize = 7;
+  bytes mapRawData = 8;                   // Image fragment bytes
+}
+
+// Source: SDK ImageRawDataUpdate (simplified "EvenHubImageContainer")
+// Higher-level wrapper: containerID + containerName + full imageData
+message ImageRawDataUpdate {
+  uint32 Container_ID = 1;
+  string Container_Name = 2;
+  bytes imageData = 3;
+}
+
+// Source: SDK ShutDownContaniner — "对应宿主 PB：ShutDownContaniner"
+// Note: "Contaniner" is the PB spelling (typo in firmware)
+// Sent via bridge.shutDownPageContainer()
+// G1 CORRELATION: Equivalent to cmd 0x18 [0x18] → exit to dashboard
+message ShutDownContaniner {
+  uint32 exitMode = 1;   // 0 = exit immediately, 1 = prompt user first
+}
+
+// =============================================================================
+// EvenHub Events (Glasses → Flutter → WebView)
+// =============================================================================
+
+// Source: SDK List_ItemEvent — "对齐 PB: List_ItemEvent"
+// Emitted when user interacts with a list container on the glasses
+message ListItemEvent {
+  uint32 Container_ID = 1;
+  string Container_Name = 2;
+  string CurrentSelect_ItemName = 3;
+  uint32 CurrentSelect_ItemIndex = 4;
+  OsEventType Event_Type = 5;
+}
+
+// Source: SDK Text_ItemEvent — "对齐 PB: Text_ItemEvent"
+// Emitted when user interacts with a text container on the glasses
+message TextItemEvent {
+  uint32 Container_ID = 1;
+  string Container_Name = 2;
+  OsEventType Event_Type = 3;
+}
+
+// Source: SDK Sys_ItemEvent — "对齐 PB: Sys_ItemEvent"
+// Emitted for system-level events (foreground enter/exit, abnormal exit)
+message SysItemEvent {
+  OsEventType Event_Type = 1;
+}
+
+// Source: SDK AudioEventPayload
+// Emitted when mic is active — raw PCM audio chunks
+// CONFIRMED: 16kHz, 16-bit signed LE, mono, 3200 bytes per chunk (100ms)
+//
+// G1 CORRELATION: At BLE level, G1 uses LC3 codec (not raw PCM):
+//   cmd 0xF1: [0xF1, pack_seq, <200 bytes LC3>]
+//   LC3 params: 16kHz, 10ms frames, 20 bytes/frame → 10 frames per packet = 100ms
+//   Flutter decodes LC3→PCM via liblc3 (C library) before passing to SDK
+//   G2 likely uses the same LC3 encoding at BLE layer, with Flutter
+//   performing the decode to produce the 3200-byte PCM chunks seen at SDK level.
+//
+// G1 Mic Control: cmd 0x0E → [0x0E, 0x01] to enable mic
+//   Response: success if byte[1] == 0xC9
+//   G2 equivalent: AudioControl message via Flutter bridge
+//   ❌ TESTED 2026-02-27: All 6 raw BLE approaches failed to enable mic:
+//      1. AudioControl{isOpen=true} on 0x0B-20 (Conversate)
+//      2. Raw bytes [0x0E, 0x01] on 0x0B-20
+//      3. AudioControl on 0x11-20 (service 0x11)
+//      4. Raw bytes on 0x11-20
+//      5. AudioControl on 0x80-20 (sync service)
+//      6. Direct write to 0x7450 (audio characteristic)
+//   These approaches all looked on the WRONG channel (audio 0x7402).
+//
+// ★★★ BREAKTHROUGH 2026-02-27: G2 MIC AUDIO ON DISPLAY CHANNEL ★★★
+//
+//   G2 mic audio does NOT use the audio characteristic (0x7402) at all!
+//   Audio streams on the DISPLAY notify characteristic (0x6402) on the LEFT arm.
+//
+//   RAW BLE AUDIO PACKET STRUCTURE (CONFIRMED 2026-02-27, analyze_bin.py):
+//     Channel:   0x6402 (display notify), LEFT arm only  
+//     Size:      205 bytes (constant, every packet)
+//     Rate:      20.1 packets/sec (~50ms interval) ★ CONFIRMED across 2 captures
+//     Framing:   NO 0xAA header — raw data, not protocol-framed
+//     Counter:   Byte[204] = sequential packet counter (0x00..0xFF, wraps)
+//                ★ CONFIRMED: 246/246 consecutive transitions sequential
+//                ★ Counter is MONOTONIC across mic ON/OFF gaps (no lost packets)
+//                ★ Each value appears exactly once (247 unique out of 247 packets)
+//     Data:      Bytes[0..203] = 5 × LC3 frames (204 bytes)
+//     Entropy:   7.95 bits/byte overall (near-perfect compression)
+//     Bitrate:   204 × 8 × 20 = 32,640 bps ≈ 32 kbps
+//
+//   INTERNAL FRAME STRUCTURE (from byte-position entropy analysis):
+//     204 data bytes = 5 × 40-byte LC3 frames + 4 bytes metadata
+//
+//     Byte[  0.. 39]  Frame 0  (high entropy, byte[39] entropy=3.18)
+//     Byte[ 40.. 79]  Frame 1  (high entropy, byte[79] entropy=3.36)
+//     Byte[ 80..119]  Frame 2  (high entropy, byte[119] entropy=3.24)
+//     Byte[120..159]  Frame 3  (high entropy, byte[159] entropy=3.25)
+//     Byte[160..199]  Frame 4  (high entropy, byte[199] entropy=3.09)
+//     Byte[200]       Variable (range 0-164, 104 unique values)
+//     Byte[201]       ALWAYS 0x00 (zero entropy — constant)
+//     Byte[202]       5 unique values {0xEF, 0xF8, ...} — flags/mode
+//     Byte[203]       Mostly 0xFF (entropy 0.94, 2 unique values) — end marker
+//     Byte[204]       Sequential counter
+//
+//     This maps to: LC3 @ 16kHz, 10ms frame, 32kbps → frame_size = 40 bytes
+//     5 frames × 10ms = 50ms per BLE packet = 20 packets/sec ✓
+//     40 bytes × 8 bits × 100 frames/sec = 32,000 bps ✓
+//
+//   CODEC ANALYSIS (CONFIRMED: LC3 32kbps 16kHz 10ms frames):
+//     - 5 × 40-byte LC3 frames per BLE packet (204 bytes data)
+//     - 40-byte boundary has low-entropy byte (last byte of each frame)
+//       suggesting frame-level structure (possibly a CRC or codec marker)
+//     - Adjacent packet similarity ~3.6% (vs 0.39% random) — modest temporal correlation
+//     - Frame-last-byte values cluster: ~8-12 unique values per position
+//     - Flutter SDK decodes LC3 → PCM (16kHz, 16-bit, mono) before passing to web app
+//
+//   MIC ON/OFF CONTROL (observed from mic_capture.py, 2026-02-27):
+//     Dashboard service 07-01 field f3.f1 signals audio state:
+//       f3.f1=1 → mic ACTIVE (audio stream starts)
+//       f3.f1=3 → mic INACTIVE (audio stream stops)
+//
+//     Observed mic toggle pattern (from mic_capture 247-pkt session):
+//       [29.8s] 07-01 page 8 {f3:{f1:1}}  → mic ON indicator
+//       [29.8s] 0D-01 state change
+//       [29.9s] Audio burst 0 begins (154 pkts, 7.7s, 20.1/sec)
+//       [37.6s] 07-01 page 9 {f3:{f1:3}}  → mic OFF (audio stops)
+//       --- 23.9 second gap (counter continues monotonically) ---
+//       [61.1s] 07-01 page 10 {f3:{f1:1}} → mic ON again
+//       [61.4s] Audio burst 1 begins (93 pkts, 4.6s, 20.1/sec)
+//       [66.1s] Script ended
+//
+//     Page numbers (8,9,10) increment per session (gesture capture had 5,6,7).
+//     The f3.f1 field is the KEY: 1=active, 3=stopped.
+//     Counter at burst 0 end=36, burst 1 start=37: NO packets lost during gap.
+//
+//   TRIGGER SEQUENCE (first observed from gesture capture):
+//     1. Quiet mode exit (user releases both-arm touch)
+//     2. [80.2s] 07-01 (Dashboard) notification: {f1:1, f2:N, f3:{f1:1}}
+//     3. [80.6s] Audio stream begins on LEFT arm display channel (400ms later)
+//     4. [80.8s] 0D-01 state transition: {f1:1, f3:{f1:1, f2:7}}
+//     5. [87.6s] 07-01 dashboard page N+2: {f1:1, f2:N+2, f3:{f1:3}}
+//     6. Audio stream ends
+//     
+//     The mic trigger command is sent by Even Hub app through ITS OWN GATT connection
+//     (our BLE sniffer only sees notifications, not writes from other clients).
+//     The Flutter SDK's bridge.audioControl(true/false) mediates.
+//
+//   DATA FLOW (complete path):
+//     Mic (left arm) → LC3 encode (glasses firmware, 5×10ms=50ms frames) → 
+//     BLE 0x6402 notify (LEFT arm, 205-byte packets at 20Hz) →
+//     Flutter SDK (LC3 decode: 5×40B → 5×320B PCM) → 
+//     audioEvent.audioPcm (3200 bytes/100ms to web app, = 1600 samples × 16-bit)
+//
+//   TOOLS: tools/mic_capture.py — captures raw audio from display channel
+//
+message AudioEventPayload {
+  bytes audioPcm = 1;     // 3200 bytes = 1600 samples at 16kHz = 100ms
+  // NOTE: This is the SDK-level (post-decode) format. Raw BLE data is compressed.
+  // See BLE audio packet structure in comments above.
+}
+
+// Unified EvenHub event wrapper (Flutter → WebView)
+// Source: SDK EvenHubEvent type
+// Exactly one of the event fields will be populated per message
+message EvenHubEvent {
+  ListItemEvent listEvent = 1;
+  TextItemEvent textEvent = 2;
+  SysItemEvent sysEvent = 3;
+  AudioEventPayload audioEvent = 4;
+}
+
+// =============================================================================
+// Audio Control (WebView → Flutter → BLE)
+// =============================================================================
+
+// Source: bridge.audioControl({isOpen: true/false})
+// This triggers Flutter to send a BLE command to enable/disable the mic
+// The exact BLE characteristic/command is handled by Flutter internally
+message AudioControl {
+  bool isOpen = 1;          // true = start mic streaming, false = stop
+}
+
+// =============================================================================
+// Authentication Service (0x80-00, 0x80-20)
+// G1 CORRELATION: G1 uses a simple init byte instead of auth sequence:
+//   iOS:     [0x4D, 0x01] sent after characteristic discovery
+//   Android: [0xF4, 0x01] sent after service discovery
+//   G2 upgraded to a 7-packet handshake with timestamp + transaction ID,
+//   suggesting G2 has session-based security that G1 lacked.
+// =============================================================================
+
+message AuthRequest {
+  uint32 type = 1;          // 0x04 = capability, 0x80 = time sync
+  uint32 msg_id = 2;
+  AuthData data = 3;
+}
+
+message AuthData {
+  uint32 capability = 1;    // 0x01 = basic, 0x04 = full
+}
+
+message TimeSyncRequest {
+  uint32 type = 1;          // 0x80
+  uint32 msg_id = 2;
+  TimeSyncData sync = 16;   // Field 16 (0x82 0x08)
+}
+
+message TimeSyncData {
+  uint32 unknown1 = 2;      // Always 17 (0x11)?
+  uint64 timestamp = 1;     // Unix timestamp (varint)
+  int64 transaction_id = 2; // Usually -24 (0xFFFFFFFFFFFFFFE8)
+}
+
+// =============================================================================
+// Teleprompter Service (0x06-20)
+// =============================================================================
+
+message TeleprompterMessage {
+  uint32 type = 1;          // 1=init, 2=list, 3=content, 4=complete, 255=marker
+  uint32 msg_id = 2;
+
+  // One of the following based on type:
+  TeleprompterInit init = 3;           // type=1
+  TeleprompterList list = 4;           // type=2
+  TeleprompterContent content = 5;     // type=3
+  TeleprompterComplete complete = 6;   // type=4
+  TeleprompterMarker marker = 13;      // type=255
+}
+
+message TeleprompterInit {
+  uint32 script_index = 1;
+  TeleprompterDisplaySettings display = 2;
+}
+
+message TeleprompterDisplaySettings {
+  uint32 field1 = 1;            // Always 1
+  uint32 field2 = 2;            // Always 0
+  uint32 field3 = 3;            // Always 0
+  uint32 display_width = 4;     // 267
+  uint32 content_height = 5;    // Total content height (affects scroll bar)
+  uint32 line_height = 6;       // 230
+  uint32 viewport_height = 7;   // 1294 (visible area)
+  uint32 font_size = 8;         // 5
+  uint32 scroll_mode = 9;       // 0=manual, 1=AI
+}
+
+message TeleprompterList {
+  repeated TeleprompterScript scripts = 1;
+}
+
+message TeleprompterScript {
+  string script_id = 1;     // e.g., "teleprompter_createdId_1766814694346"
+  string title = 2;         // e.g., "Teleprompt Title"
+}
+
+message TeleprompterContent {
+  uint32 page_number = 1;   // 0-indexed
+  uint32 line_count = 2;    // Always 10
+  bytes text = 3;           // UTF-8 with \n separators
+}
+
+message TeleprompterComplete {
+  uint32 start_page = 1;    // Always 0
+  uint32 total_pages = 2;
+  uint32 total_lines = 3;
+}
+
+message TeleprompterMarker {
+  uint32 field1 = 1;        // Always 0
+  uint32 field2 = 2;        // Always 6
+}
+
+// Start command (type=1 with state)
+message TeleprompterStart {
+  uint32 type = 1;          // 1
+  uint32 msg_id = 2;
+  TeleprompterState state = 3;
+}
+
+message TeleprompterState {
+  uint32 state = 1;         // 4 = START
+}
+
+// =============================================================================
+// Display Config Service (0x0E-20)
+// =============================================================================
+
+message DisplayConfig {
+  uint32 type = 1;          // 2
+  uint32 msg_id = 2;
+  DisplaySettings settings = 4;
+}
+
+message DisplaySettings {
+  uint32 enabled = 1;
+  repeated DisplayRegion regions = 2;
+  uint32 field3 = 3;
+}
+
+message DisplayRegion {
+  uint32 region_id = 1;     // 2, 3, 4, 5, 6
+  uint32 param1 = 2;        // Varies
+  float param2 = 3;         // Float (IEEE 754)
+  float param3 = 4;         // Float
+  uint32 param4 = 5;        // 0
+  uint32 param5 = 6;        // 0
+}
+
+// =============================================================================
+// Sync Service (0x80-00) — Heartbeat / Keep-Alive
+// ✅ CONFIRMED 2026-02-27: Periodic keep-alive, glasses echo back.
+//    Interval: 8 seconds (same as G1 cmd 0x25).
+//    Session stays alive 95s+ with heartbeat.
+//    Without heartbeat, session survives ~30s idle (from teleprompter tests).
+// =============================================================================
+
+message SyncMessage {
+  uint32 type = 1;          // 0x0E = sync trigger
+  uint32 msg_id = 2;
+  bytes data = 13;          // Empty (6A-00)
+}
+
+// =============================================================================
+// Dashboard Service (0x07-20 → response on 0x07-00)
+// =============================================================================
+
+message DashboardMessage {
+  uint32 type = 1;
+  uint32 msg_id = 2;
+  DashboardWidget widget = 3;
+}
+
+message DashboardWidget {
+  uint32 widget_type = 1;   // Calendar, weather, etc.
+  bytes content = 2;        // Widget-specific data
+}
+
+// Response observed 2026-02-26:
+//   type=2, msg_id=22, widget={type=1} — ACK for widget type 1
+//   type=2, msg_id=23, widget={type=2} — ACK for widget type 2
+message DashboardResponse {
+  uint32 type = 1;          // 2 (ACK)
+  uint32 msg_id = 2;
+  DashboardWidget widget = 4; // Field 4 (tag 0x22)
+}
+
+// =============================================================================
+// Display Wake Service (0x04-20 → response on 0x04-00)
+// =============================================================================
+
+message DisplayWake {
+  uint32 type = 1;          // 1
+  uint32 msg_id = 2;
+  DisplayWakeSettings settings = 3;
+}
+
+message DisplayWakeSettings {
+  uint32 field1 = 1;        // 1
+  uint32 field2 = 2;        // 1
+  uint32 field3 = 3;        // 5
+  uint32 field5 = 5;        // 1
+}
+
+// Response observed 2026-02-26:
+//   type=1, msg_id=25, settings={field1=1, field2=1, field3=5}
+message DisplayWakeResponse {
+  uint32 type = 1;
+  uint32 msg_id = 2;
+  DisplayWakeSettings settings = 3; // Echoes back the wake settings
+}
+
+// =============================================================================
+// Conversate Service (0x0B-20 → response on 0x0B-00)
+// =============================================================================
+
+message ConversateMessage {
+  uint32 type = 1;
+  uint32 msg_id = 2;
+  ConversateTranscript transcript = 7;  // Field 7
+}
+
+message ConversateTranscript {
+  string text = 1;          // Transcribed text
+  bool is_final = 2;        // True if final result
+}
+
+// Response observed 2026-02-26:
+//   type=162 (0xA2), msg_id=36/37, field 9 = empty
+//   Type 162 may indicate "ready" or "idle" state for speech service
+message ConversateResponse {
+  uint32 type = 1;          // 162 observed
+  uint32 msg_id = 2;
+  bytes state = 9;          // Field 9 (tag 0x4A) — empty in observed packets
+}
+
+// =============================================================================
+// Notification Service (0x02-20)
+// G1 CORRELATION: cmd 0x4B with JSON payload {"ncs_notification": {...}}
+//   G1 uses 176-byte chunks: [0x4B, msgId, maxSeq, seq, ...json]
+//   G2 switched to protobuf encoding. Note: G1 includes full notification
+//   text in JSON, while G2 NotificationData only has app_id + count.
+//   Full notification content delivery on G2 may use additional fields
+//   or a separate container-based mechanism.
+// =============================================================================
+
+message NotificationMessage {
+  uint32 type = 1;
+  uint32 msg_id = 2;
+  NotificationData notification = 3;
+}
+
+message NotificationData {
+  uint32 app_id = 1;        // e.g., 0x1A = Gmail
+  uint32 count = 2;         // Number of notifications
+  // NOTE: No text content - only metadata
+}
+
+// =============================================================================
+// Device Info Service (0x09-00 → response on 0x09-01)
+// Discovered: 2026-02-26 session probe
+// =============================================================================
+
+message DeviceInfoRequest {
+  uint32 type = 1;          // Sent type 1-5, all returned data
+  uint32 msg_id = 2;
+}
+
+message DeviceInfoResponse {
+  uint32 type = 1;          // 2 in observed responses
+  uint32 msg_id = 2;
+  DeviceInfoData info = 4;  // Field 4 (tag 0x22)
+}
+
+message DeviceInfoData {
+  uint32 field2 = 2;        // 25 (observed)
+  uint32 model_variant = 3; // 7
+  uint32 device_type = 4;   // 2
+  string firmware_version = 5; // "2.0.7.16"
+  string hardware_version = 6; // "2.0.7.16"
+  uint32 field7 = 7;        // 1
+  uint32 field8 = 8;        // 30 (battery? metric?)
+  uint32 field10 = 10;      // 1
+  uint32 field11 = 11;      // 1 (present in some responses)
+  uint32 battery_percent = 12; // 100 (observed when fully charged)
+  uint32 field18 = 18;      // 1 (connection state?)
+}
+
+// =============================================================================
+// Configuration Service (0x0D-00 → response on 0x0D-01)
+// Discovered: 2026-02-26 session probe
+// =============================================================================
+
+message ConfigRequest {
+  uint32 type = 1;          // Sent types 1-3
+  uint32 msg_id = 2;
+}
+
+message ConfigResponse {
+  uint32 type = 1;          // Always 1 in responses
+  ConfigData data = 3;      // Field 3 (tag 0x1A)
+}
+
+message ConfigData {
+  uint32 setting_id = 1;    // Observed: 1, 3, 11 (0x0B)
+  uint32 setting_value = 2; // Observed: 3
+  // Empty data = ack with no return value
+}
+
+// =============================================================================
+// Tasks Service (0x0C-20 → response on 0x0C-00)
+// Discovered: 2026-02-26 session probe — ACKs types 1, 2, 3
+// =============================================================================
+
+message TasksRequest {
+  uint32 type = 1;          // 1, 2, 3 all ACK'd
+  uint32 msg_id = 2;
+  // TODO: Find payload format for creating/listing tasks
+}
+
+message TasksResponse {
+  uint32 type = 1;          // Echoes back the type sent
+  uint32 msg_id = 2;
+  // Empty field 3/4/5 = simple ACK
+}
+
+// =============================================================================
+// Display Trigger Service (0x81-20 → response on 0x81-00)
+// Discovered: 2026-02-26 session probe
+// =============================================================================
+
+message DisplayTriggerResponse {
+  uint32 type = 1;          // 1
+  uint32 msg_id = 2;
+  DisplayTriggerData data = 3; // Field 3
+}
+
+message DisplayTriggerData {
+  uint32 value = 1;         // 97 (0x61) — brightness? display state %?
+}
+
+// =============================================================================
+// Event Stream Service (0x01-01)
+// Discovered: 2026-02-26 session probe
+//
+// ⚠️ CRITICAL FINDING (2026-02-27): Events are NOT emitted in response
+// to raw BLE service commands. The event stream requires an active EvenHub
+// SDK container session (Flutter host + WebView lifecycle). Three separate
+// hardware tests with service preambles (DeviceInfo, Config, Dashboard,
+// DisplayWake, Tasks, DisplayTrigger) all produced 0 events.
+//
+// The ONLY capture containing events (probe_capture_20260226_124141.json)
+// was recorded during an active EvenHub SDK session (whatsapp app).
+//
+// Decoded event analysis (23 events from that capture):
+//   - All type=3, session_id=305419896 (0x12345678)
+//   - Counters: 1022→1043, plus one at 2009
+//   - Source=1 events (16 total): have category + value fields
+//     cat=1/val=2 x3, cat=2/val=3 x3, cat=3/val=4 x3, cat=4/val=5 x6
+//     Pattern: value = category + 1 (always)
+//   - Source=3,4,5,6 events (7 total): empty detail (no category/value)
+//   - Some events have extra empty fields at tag 0x22 or 0x3A
+//
+// G1 CORRELATION: Maps to cmd 0xF5 (device event notifications).
+// G1 event indices discovered in EvenDemoApp:
+//   0  = Exit current function (→ G2 category=1? system exit)
+//   1  = Touchpad swipe: L peripheral=prev page, R peripheral=next page
+//        (→ G2 category=4? input/gesture)
+//   23 = Even AI start request from glasses (→ G2 category=3?)
+//   24 = Even AI recording ended (→ G2 category=3?)
+// Hypothesized G2 EventDetail categories (UNCONFIRMED — need SDK session test):
+//   1 = System state (exit, sleep, wake)
+//   2 = Display state (on/off, brightness)
+//   3 = Feature lifecycle (AI start/stop, teleprompter)
+//   4 = Input/gesture (tap, swipe, touchpad)
+//   5 = Connection state
+//   6 = Power/battery events
+// =============================================================================
+
+message EventStreamPacket {
+  uint32 type = 1;             // Always 3
+  uint64 session_id = 2;       // Constant per session (305419896 observed)
+  EventData event = 6;         // Field 6 (tag 0x32)
+}
+
+message EventData {
+  uint32 event_counter = 1;    // Incrementing: 1022, 1023, 1024...
+  EventPayload payload = 5;    // Field 5 (tag 0x2A)
+}
+
+message EventPayload {
+  uint32 source = 1;           // 1=has details, 3/4/5/6=empty detail observed
+  EventDetail detail = 2;      // Field 2 (tag 0x12) — absent when source≠1
+}
+
+message EventDetail {
+  uint32 category = 1;         // 1=system?, 2=display?, 3=teleprompter?, 4=input?, 5=?, 6=?
+  uint32 value = 2;            // 2, 3, 4, 5 observed — state/priority/action?
+  // Some events have shorter payloads (no value field)
+  // Some have empty field 4 (tag 0x22) or field 7 (tag 0x3A)
+}
+
+// =============================================================================
+// G1 Protocol Reference (from EvenDemoApp — github.com/even-realities/EvenDemoApp)
+//
+// The G1 uses a DIFFERENT transport layer but shares functional concepts
+// with G2. Documenting here for cross-reference and to inform G2 RE work.
+//
+// G1 Transport:
+//   BLE Service:     Nordic UART (6E400001-B5A3-F393-E0A9-E50E24DCCA9E)
+//   TX (write):      6E400002-B5A3-F393-E0A9-E50E24DCCA9E (Write Without Response)
+//   RX (notify):     6E400003-B5A3-F393-E0A9-E50E24DCCA9E
+//   Packet format:   [cmd_byte] [params...] — no protobuf, no CRC, no header framing
+//   Two peripherals: G1_XX_L_YYYY (left) + G1_XX_R_YYYY (right) connected simultaneously
+//   ACK byte:        0xC9 = success, 0xCB = success (alternate)
+//
+// G2 Transport (for comparison):
+//   BLE Service:     Custom (00002760-08c2-11e1-9073-0e8ac72e0000)
+//   Write:           ...5401 (Write Without Response)
+//   Notify:          ...5402
+//   Packet format:   [0xAA header(8)] [protobuf payload] [CRC-16/CCITT(2)]
+//   Single device:   Even G2_XX_L_YYYYYY (one peripheral)
+//
+// =============================================================================
+//
+// G1 COMMAND TABLE (cmd = first byte of UART packet)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 0x04 — App Whitelist (Phone → Glasses)
+//   Format:  [0x04, maxSeq, seq, ...json_data]
+//   Payload: JSON string listing allowed notification apps
+//   Chunks:  180-byte payload segments
+//   G2 equivalent: Unknown (may be deprecated or moved to config service 0x0D)
+//
+// 0x0E — Mic Enable (Phone → Glasses)
+//   Format:  [0x0E, 0x01]
+//   Response: byte[1] == 0xC9 = success
+//   G2 equivalent: AudioControl message via Flutter bridge; raw BLE cmd unknown
+//
+// 0x15 — BMP Image Data (Phone → Glasses)
+//   First packet:  [0x15, index, 0x00, 0x1C, 0x00, 0x00, ...bitmap_data]
+//   Subsequent:    [0x15, index, ...bitmap_data]
+//   Chunk size:    194 bytes payload
+//   Address:       0x001C0000 (glasses display memory)
+//   G2 equivalent: ImageRawDataUpdateFields (protobuf with fragmentation)
+//
+// 0x16 — BMP CRC Verify (Phone → Glasses)
+//   Format:  [0x16, crc32_b3, crc32_b2, crc32_b1, crc32_b0]
+//   CRC:     CRC32-XZ over [address_4bytes + full_image_bytes]
+//   Success: byte[5] == 0xC9
+//   G2 equivalent: Part of ImageRawDataUpdateFields flow
+//
+// 0x18 — Exit to Dashboard (Phone → Glasses)
+//   Format:  [0x18]
+//   Response: byte[1] == 0xC9 = success
+//   G2 equivalent: ShutDownContaniner { exitMode = 0 }
+//
+// 0x20 — BMP Transfer Complete (Phone → Glasses)
+//   Format:  [0x20, 0x0D, 0x0E]
+//   Response: byte[1] == 0xC9 = success
+//   G2 equivalent: Part of ImageRawDataUpdateFields flow (final fragment)
+//
+// 0x25 — Heartbeat (Bidirectional, every 8 seconds)
+//   Format:  [0x25, len_lo, len_hi, seq, 0x04, seq]
+//   Length:  Always 6
+//   Validate: byte[0]==0x25 && byte[4]==0x04
+//   G2 equivalent: SyncMessage on 0x80-00 (type=0x0E) — periodic keep-alive
+//   NOTE: G2 heartbeat interval unknown; G1 is every 8 seconds
+//
+// 0x34 — Get Serial Number (Phone → Glasses)
+//   Format:  [0x34]
+//   Response: SN at bytes[2..18] (16-char string)
+//   G2 equivalent: DeviceInfoRequest on 0x09-00
+//
+// 0x4B — Notification (Phone → Glasses)
+//   Format:  [0x4B, msgId, maxSeq, seq, ...json_data]
+//   Payload: JSON: {"ncs_notification": { app_data }}
+//   Chunks:  176-byte payload segments
+//   G2 equivalent: NotificationMessage on 0x02-20 (protobuf, not JSON)
+//
+// 0x4D — Init Handshake iOS (Phone → Glasses)
+//   Format:  [0x4D, 0x01]
+//   Sent immediately after BLE characteristic discovery
+//   G2 equivalent: Auth sequence (7 packets on 0x80-00/0x80-20)
+//
+// 0x4E — Even AI / Display Text (Phone → Glasses)
+//   Format:  [0x4E, syncSeq, maxSeq, seq, newScreen, pos_hi, pos_lo,
+//             current_page_num, max_page_num, ...utf8_text]
+//   Chunks:  191-byte payload segments
+//   newScreen = status | type, where type is always 0x01:
+//     0x31 = First display (must precede 0x41)
+//     0x41 = Auto-scroll page (sent 3s after 0x31)
+//     0x51 = Manual page (touchpad navigation)
+//     0x61 = Network error display
+//     0x71 = Text service / teleprompter display
+//   Display: 5 lines visible, ~488px width, 21px font size
+//   G2 equivalent: TeleprompterMessage on 0x06-20 (protobuf, page-based)
+//     G1 newScreen 0x31/0x41 → G2 teleprompter type=1 (init) + type=3 (content)
+//     G1 newScreen 0x51      → G2 swipe events on 0x01-01
+//     G1 pos field           → G2 TeleprompterContent.page_number
+//     G1 page_num fields     → G2 TeleprompterComplete.total_pages
+//
+// 0xF1 — Audio Data (Glasses → Phone)
+//   Format:  [0xF1, pack_seq, <200 bytes LC3 data>]
+//   Total:   202 bytes per packet
+//   Codec:   LC3 (Low Complexity Communication Codec)
+//   Params:  16kHz sample rate, 10ms frame duration, 20 bytes per frame
+//   Frames:  10 per packet = 100ms of audio
+//   Decoded: liblc3 (C) → 16-bit PCM, mono, 16kHz
+//   G2 equivalent: AudioEventPayload.audioPcm (already decoded to PCM by Flutter)
+//   KEY INSIGHT: G2 BLE layer almost certainly also uses LC3, with the
+//   Flutter host performing LC3→PCM decode before passing to the web SDK.
+//
+// 0xF4 — Init Handshake Android (Phone → Glasses)
+//   Format:  [0xF4, 0x01]
+//   Same as 0x4D but Android-specific (platform init divergence)
+//   G2 equivalent: Auth sequence (same as 0x4D)
+//
+// 0xF5 — Device Event (Glasses → Phone, unsolicited)
+//   Format:  [0xF5, event_index]
+//   Event indices:
+//     0  = Exit current function (app should call Proto.exit())
+//     1  = Touchpad swipe (L peripheral = prev page, R peripheral = next page)
+//     23 = Even AI start request (glasses want mic recording)
+//     24 = Even AI record over (glasses ended recording)
+//   G2 equivalent: EventStreamPacket on 0x01-01
+//     G1 event 0  → G2 category=1 (system exit)
+//     G1 event 1  → G2 category=4 (input/gesture) — NOTE: G2 is single device,
+//                    so swipe direction is encoded in value field, not L/R peripheral
+//     G1 event 23 → G2 category=3? (feature start)
+//     G1 event 24 → G2 category=3? (feature end)
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
+// G1 DISPLAY RENDERING MODEL
+// ───────────────────────────────────────────────────────────────────────────
+// G1 Even AI displays 5 lines of text at ~488px width, 21px font.
+// Text is measured with Flutter TextPainter to determine line wrapping.
+// Pages auto-advance every 5-8 seconds, or manual via touchpad swipe.
+//
+// G2 Teleprompter uses 10 lines per page, ~25 chars width,
+// with a scroll bar and protobuf-based page delivery.
+// The G2 model is more structured (page_number, line_count, content)
+// while G1 is raw text with positional metadata.
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
+// G1 BMP IMAGE TRANSFER PROTOCOL
+// ───────────────────────────────────────────────────────────────────────────
+// 1. Send chunks via cmd 0x15 (194-byte payloads, incrementing index)
+//    First chunk includes 4-byte memory address [0x00, 0x1C, 0x00, 0x00]
+// 2. Signal completion via cmd 0x20: [0x20, 0x0D, 0x0E]
+// 3. Verify CRC via cmd 0x16: CRC32-XZ over [address + image], 4 bytes big-endian
+// 4. iOS delay: 8ms between chunks; Android: 5ms
+//
+// G2 equivalent uses ImageRawDataUpdateFields protobuf with:
+//   Container_ID, mapSessionId, mapTotalSize, compressMode,
+//   mapFragmentIndex, mapFragmentPacketSize, mapRawData
+//   This is more structured with session tracking and compression support.
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
+// INSIGHTS FOR FURTHER G2 REVERSE ENGINEERING
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 1. AUDIO BLE COMMAND: ❌ TESTED — all raw BLE approaches failed.
+//    G1 mic enable = [0x0E, 0x01] on UART, but G2 equivalent is NOT a
+//    simple BLE write. Tested 0x0B-20, 0x11-20, 0x80-20, 0x7450 — none
+//    produced audio data. Mic enable requires Flutter host mediation
+//    (AudioControl method through the EvenHub SDK bridge).
+//
+// 2. HEARTBEAT: ✅ CONFIRMED — G2 SyncMessage(type=0x0E) on 0x80-00
+//    is the heartbeat. 8-second interval (same as G1 cmd 0x25).
+//    Glasses echo the SyncMessage back. Session survives 95s+ with
+//    heartbeat active, ~30s idle without.
+//
+// 3. EVENT CATEGORIES: ⚠️ REQUIRES SDK SESSION.
+//    Raw BLE service commands do NOT trigger event stream on 0x01-01.
+//    Events only appear during active EvenHub SDK container sessions.
+//    NEXT STEP: Run a hybrid test — start whatsapp SDK session + BLE
+//    sniffer simultaneously to capture events during real interaction.
+//    Decoded data so far:
+//      source=1: cat=1/val=2, cat=2/val=3, cat=3/val=4, cat=4/val=5
+//      source=3,4,5,6: empty detail payloads
+//      Pattern: val = cat + 1 for source=1 events
+//    G1's simple indices (0, 1, 23, 24) may map to these categories,
+//    but confirmation requires gesture correlation during SDK session.
+//
+// 4. NOTIFICATION FORMAT: G1 uses JSON {"ncs_notification": {...}}.
+//    G2 uses protobuf NotificationData with only app_id and count.
+//    The text content may be in additional fields not yet captured,
+//    or G2 may truly only support metadata (badge-style) notifications.
+//
+// 5. DISPLAY WAKE: G1 has no explicit wake command (display is always on
+//    when connected). G2 has DisplayWake on 0x04-20, suggesting G2 has
+//    more aggressive power management. The value 97 in DisplayTriggerData
+//    may be a percentage or brightness level.
+//
+// 6. ⚠️ STATE CORRUPTION: Sending raw BLE service commands (especially
+//    multiple services in sequence) can put glasses in a confused state
+//    where existing features (e.g., teleprompter scroll) stop working.
+//    Recovery requires power-cycling the glasses. Always test with clean
+//    state and avoid mixing raw BLE probing with SDK sessions.
+//
+// 7. HYBRID TEST STRATEGY: To map gesture→event categories, run the
+//    whatsapp EvenHub app (which establishes SDK session) while
+//    simultaneously sniffing BLE traffic with a raw BLE tool.
+//    This should produce events on 0x01-01 that can be correlated
+//    with physical gestures (tap, swipe up/down, double-tap).
+//
+// 8. THREE-DEVICE CONNECTION: ✅ CONFIRMED from HCI capture.
+//    Even Hub (com.even.sg) connects to 3 BLE peripherals in sequence:
+//      t=27s: Device 1 (A590B18A) → glasses arm, subscribe 4 chars → 1 init write
+//      t=33s: Device 2 (45E760C1) → glasses arm, subscribe 4 chars → 20 writes (init burst)
+//      t=44s: Device 3 (884A62D5) → R1 RING, subscribe 1 char → control input
+//    Write pattern: burst of ~21 writes at init, then steady ~2/sec,
+//    ramping up to ~20/sec during active comms (teleprompter/display).
+//    GATT indications: 508 over 53s = ~9.7/sec avg, peak 25/sec.
+//    The R1 ring (Device 3) only gets 1 subscribe — it's the input controller
+//    that sends tap, double tap, long press, and scroll events.
+//    Our tools must connect to BOTH arms + optionally the ring for full functionality.
+//
+// 10. R1 RING INPUT EVENTS:
+//    The R1 ring is confirmed as the control device for G2 glasses.
+//    Supported gestures: tap, double tap, long tap, scroll (up/down).
+//    Ring→glasses control flow:
+//      Ring gesture → BLE event → glasses firmware → EventStream 0x01-01
+//    The ring likely connects directly to the glasses (not through the phone),
+//    with the phone app receiving forwarded events on 0x01-01.
+//    This means gesture events should appear even without the Even Hub SDK
+//    IF we're subscribed to 0x01-01 on both arms.
+//    Previous "events require SDK session" conclusion may have been wrong —
+//    events may require the RING to be connected (which it always is in normal use).
+//
+// 11. ARM TOUCH GESTURES:
+//    Both glasses arms have capacitive touch sensors (TouchBar).
+//    Known arm gestures:
+//      - Single tap (left arm / right arm)
+//      - Double tap
+//      - Swipe forward / backward
+//      - Long press (left / right)
+//      - DUAL-ARM SIMULTANEOUS TOUCH → QUIET MODE (confirmed in Even Hub)
+//    Quiet mode likely produces a specific event on 0x01-01 that the app
+//    listens for and responds to by toggling audio/notification muting.
+//    This is distinct from ring gestures — it's a glasses-only input path.
+//
+// 9. HEARTBEAT INTERVAL: 30 seconds in Even Hub captures (not 8s).
+//    test_g1_findings.py used 8s interval (matching G1 cmd 0x25).
+//    The HCI capture shows Heart Beat events at exactly 30s intervals
+//    (t=3.6s, 33.6s, 63.6s). This is the macOS BLE stack heartbeat,
+//    not the application-level SyncMessage. Both may coexist.
+//
+// =============================================================================
